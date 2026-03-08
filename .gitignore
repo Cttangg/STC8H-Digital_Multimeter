@@ -1,0 +1,14 @@
+# 忽略 Keil 编译生成的中间文件夹
+Objects/
+Listings/
+
+# 忽略 Keil 个人设置文件
+*.uvgui.*
+*.uvopt
+
+# 忽略 PDF 文档 (如果你想保留，可以删掉这一行)
+*.pdf
+
+# 忽略常见临时文件
+*.bak
+*.dep
