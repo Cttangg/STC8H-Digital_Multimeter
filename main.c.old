@@ -1,0 +1,426 @@
+#include "stc8h.h"
+#include "oled.h"
+#include <intrins.h>
+
+#define MAIN_Fosc 24000000L
+sbit BEEP = P1^0;  // 蜂鸣器搬家到 P1.0
+sbit KEY  = P3^2;
+sbit PWM_OUT = P3^3;
+
+sbit R_SW_200K = P3^4; 
+sbit R_SW_20K  = P3^5; 
+sbit R_SW_2K   = P3^6; 
+sbit R_SW_200  = P3^7;
+
+// 定义模式与量程常量
+#define MODE_VOLT 0
+#define MODE_RES  1
+#define MODE_CONT 2
+#define MODE_FREQ 3
+#define MODE_DIODE 4
+
+// 定义电压量程
+#define RANGE_20V     0   // 20V 档
+#define RANGE_2000MV  1   // 2000mV 档
+
+#define ADC_ZERO 2130   // 短接时的原始值，代表 0V
+#define CAL_VOLT 0.01267f // 20V 档位系数（需要根据 8.99V 电池再次微调）
+#define CAL_2000MV 66.11f    // 2000mV档位的系数 (即 20V档系数 * 1000，单位换算)// 延时函数
+
+unsigned long Actual_Freq = 0;
+unsigned int Actual_Duty = 0;
+unsigned char counter = 0;
+volatile unsigned long T_High = 0, T_Period = 0;
+volatile unsigned long T_Start = 0;
+volatile unsigned long Overflow_Cnt = 0; // 溢出累加器
+unsigned int High_Overflow = 0; // 高电平期间的溢出数
+
+void delay_ms(unsigned int ms) {
+    unsigned int i;
+    do {
+        i = MAIN_Fosc / 13000;
+        while (--i);
+    } while (--ms);
+}
+
+// 适用于 P3.2 复用测量信号的按键逻辑
+unsigned char ScanKey() {
+    if (KEY == 0) {
+        unsigned int low_count = 0;
+        unsigned int total_ticks = 0;
+        
+        // 第一步：初步消抖
+        // 如果是 1kHz 的信号，低电平最多持续 1ms。
+        // 我们等待 10ms，如果依然有大量低电平，说明可能是按键。
+        delay_ms(10); 
+        
+        // 第二步：特征识别
+        // 在 50ms 内采样，如果持续为低，则是按键；如果跳变，则是信号。
+        for(total_ticks = 0; total_ticks < 50; total_ticks++) {
+            if(KEY == 0) low_count++;
+            delay_ms(1);
+        }
+
+        if (low_count > 40) { // 50ms 内有 80% 以上时间是低电平，判定为按键
+            // 第三步：区分长短按
+            unsigned int hold_time = 0;
+            while (hold_time < 100) { // 检测是否达到 1s (50ms + 10ms*95)
+                delay_ms(10);
+                if (KEY == 1) break; // 信号变高，说明松手或只是信号
+                hold_time++;
+                
+                if (hold_time >= 95) { // 达到长按阈值
+                    BEEP = 1; delay_ms(50); BEEP = 0;
+                    while(KEY == 0); // 彻底死等松手
+                    T_Period = 0; // 清除按键抖动产生的错误频率数据
+                    T_High = 0;
+                    return 2; // 长按
+                }
+            }
+            T_Period = 0; // 清除按键抖动产生的错误频率数据
+            T_High = 0;
+            return 1; // 短按
+        }
+    }
+    return 0;
+}
+
+// --- 自动量程切换函数 ---
+// 逻辑：关闭所有开关，仅开启选中档位并设为推挽输出 5V
+void Switch_Res_Range(unsigned char range) {
+    // 1. 全部设为高阻输入 (断开 P3.4, P3.5, P3.6, P3.7)
+    // 0xF0 对应二进制 1111 0000
+    P3M1 |= 0xF0; P3M0 &= ~0xF0; 
+    R_SW_200K=0; R_SW_20K=0; R_SW_2K=0; R_SW_200=0;
+
+    // 2. 开启目标档位并设为推挽输出 (0, 1)
+    switch(range) {
+        case 0: P3M1 &= ~0x10; P3M0 |= 0x10; R_SW_200K = 1; break; // P3.4 (200k)
+        case 1: P3M1 &= ~0x20; P3M0 |= 0x20; R_SW_20K  = 1; break; // P3.5 (20k)
+        case 2: P3M1 &= ~0x40; P3M0 |= 0x40; R_SW_2K   = 1; break; // P3.6 (2k)
+        case 3: P3M1 &= ~0x80; P3M0 |= 0x80; R_SW_200  = 1; break; // P3.7 (200R)
+    }
+}
+
+
+// ADC 初始化
+void ADC_Init() {
+    P_SW2 |= 0x80;
+    ADCCFG = 0x2f;    
+    ADC_CONTR = 0x80; 
+    delay_ms(20);
+}
+
+// 获取 ADC
+unsigned int Get_ADC(unsigned char ch) {
+    ADC_CONTR = 0x80 | ch; 
+    _nop_(); _nop_(); _nop_(); _nop_(); 
+    delay_ms(1);           
+    ADC_CONTR |= 0x40;     
+    while (!(ADC_CONTR & 0x20)); 
+    ADC_CONTR &= ~0x20;    
+    return ((unsigned int)ADC_RES << 8) | ADC_RESL;
+}
+
+void Hardware_Capture_Init() {
+    P_SW2 |= 0x80;
+    // P3.2 设置为高阻输入并开启上拉
+    P3M1 |= 0x04; P3M0 &= ~0x04; 
+    P3PU |= 0x04;
+
+    AUXR |= 0x80;  // T0 设置为 1T 模式
+    TMOD &= 0xF0;  // 模式 0: 16位自动重装
+    TL0 = 0; TH0 = 0;
+    TR0 = 1;       // 开启计时器
+    ET0 = 1;       // 允许 T0 溢出中断
+    IT0 = 0;       // INT0 设置为上升沿和下降沿均触发
+    EX0 = 1;       // 允许外部中断
+    EA = 1;        // 开启总中断
+}
+
+// 2. 定时器 0 中断：处理溢出基准
+void Timer0_ISR(void) interrupt 1 {
+    static unsigned char toggle_cnt = 0;
+    
+    Overflow_Cnt++; // 每次溢出(约2.73ms)记录一次
+    
+    // 产生自测信号：每 4 次溢出翻转一次，产生约 45.7Hz 信号
+    if(++toggle_cnt >= 4) { 
+        PWM_OUT = !PWM_OUT;
+        toggle_cnt = 0;
+    }
+}
+
+// 3. 外部中断 0：合成完整时间戳
+void External_INT0_ISR(void) interrupt 0 {
+    unsigned int low;
+    unsigned long high;
+    unsigned long now_tick;
+
+    // 先读计数值，再读溢出次数
+    low = ((unsigned int)TH0 << 8) | TL0;
+    high = Overflow_Cnt;
+
+    // 补偿逻辑：如果定时器正好溢出但 T0 中断还没来得及运行
+    if ((TCON & 0x20) && (low < 0x8000)) high++; 
+    
+    now_tick = (high << 16) | low;
+
+    if (P32) { // 上升沿
+        T_Period = now_tick - T_Start;
+        T_Start = now_tick;
+    } else {   // 下降沿
+        T_High = now_tick - T_Start;
+    }
+}
+
+void main() {
+    // --- 变量定义 (必须在函数开头) ---
+    unsigned int adc_v, adc_r;
+    unsigned long v_sum;
+    float voltage, display_temp, res_val;
+    unsigned char i, keyAction;
+    unsigned char currentMode = 0;   
+    unsigned char currentRange = 0; // 电压模式下的量程
+    unsigned char resAutoStep = 0;  // 电阻模式下的当前尝试档位
+
+    // --- 1. 硬件初始化 ---
+    P_SW2 |= 0x80; 
+
+    // P1 配置：蜂鸣器推挽，ADC高阻
+    P1M1 = 0x3A; 
+    P1M0 = 0x01; 
+    BEEP = 0;
+
+    // P3 配置：
+    // 1. 立即将 P3.4-P3.7 (量程开关) 设为高阻输入，防止干扰电压测量
+    P3M1 |= 0xF0; P3M0 &= ~0xF0; 
+    
+    // 2. 将 P3.3 (自测信号输出) 设为推挽输出
+    P3M1 &= ~0x08; P3M0 |= 0x08;
+    P33 = 0;
+
+    // 3. 开启 P2 (OLED) 所在的准双向模式
+    P2M1 &= ~0x30; P2M0 &= ~0x30;
+
+    OLED_Init(); // 包含你已修正的翻转指令
+    OLED_Clear();
+    ADC_Init();  //
+    Hardware_Capture_Init();// 包含频率占空比测量的初始化
+    while(1) {
+
+        // --- A. 按键扫描 ---
+        keyAction = ScanKey(); 
+        if (keyAction == 2) { 
+            currentMode++;
+            if (currentMode > 4) currentMode = 0;
+            OLED_Clear(); 
+            BEEP = 0;     // 切换模式时必须强制关闭蜂鸣器
+            delay_ms(50); 
+        }
+        else if (keyAction == 1) { // 短按切换
+            if (currentMode == MODE_VOLT) {
+                currentRange++;
+                if (currentRange > 1) currentRange = 0; 
+            } else if (currentMode == MODE_RES) {
+                resAutoStep++; // 手动切档调试
+                if (resAutoStep > 3) resAutoStep = 0;
+            }
+            OLED_Clear(); 
+        }
+
+        if (currentMode != MODE_CONT) {
+            BEEP = 0; // 非通断档强制关闭蜂鸣器，防止长鸣
+        }
+
+        // --- B. 模式处理逻辑 ---
+        switch (currentMode) {
+            case MODE_VOLT:
+                v_sum = 0;
+                for(i=0; i<10; i++) { v_sum += Get_ADC(3); }
+                adc_v = (unsigned int)(v_sum / 10);
+
+                OLED_ShowString(0, 0, "MODE: VOLT  ");
+
+                // --- 基于 8.12V 实测数据的硬校准 ---
+                if (adc_v >= 2130) {
+                    // 正电压计算：(2341-2130)=211码 对应 8.12V
+                    // 系数 = 8.12 / 211 = 0.03848
+                    voltage = (float)((long)adc_v - 2130) * 0.03848f;
+                } else {
+                    // 负电压计算：(2130-1820)=310码 对应 8.12V
+                    // 系s数 = 8.12 / 310 = 0.02619
+                    voltage = (float)((long)adc_v - 2130) * 0.02619f;
+                }
+
+                // --- 修正后的显示逻辑 ---
+                OLED_ShowString(0, 2, "VAL:");
+                // 零点消隐：防止ADC抖动导致零位显示 0.05V 之类的杂波
+                if (adc_v > 2125 && adc_v < 2135) {
+                    display_temp = 0.0f;
+                    OLED_ShowChar(32, 2, ' ');
+                } else if (adc_v >= 2135) {
+                    display_temp = voltage;
+                    OLED_ShowChar(32, 2, '+');
+                } else {
+                    display_temp = -voltage; // 转为正数供显示
+                    OLED_ShowChar(32, 2, '-');
+                }
+
+                // 格式化输出 XX.XX V
+                OLED_ShowChar(40, 2, (unsigned int)display_temp / 10 + '0');
+                OLED_ShowChar(48, 2, (unsigned int)display_temp % 10 + '0');
+                OLED_ShowChar(56, 2, '.');
+                OLED_ShowChar(64, 2, (unsigned int)(display_temp * 10) % 10 + '0');
+                OLED_ShowChar(72, 2, (unsigned int)(display_temp * 100) % 10 + '0');
+                OLED_ShowChar(80, 2, 'V');
+
+                // 调试行：实时监控原始ADC
+                OLED_ShowString(0, 6, "V_RAW:");
+                OLED_ShowChar(48, 6, (adc_v / 1000 % 10) + '0');
+                OLED_ShowChar(56, 6, (adc_v / 100 % 10) + '0');
+                OLED_ShowChar(64, 6, (adc_v / 10 % 10) + '0');
+                OLED_ShowChar(72, 6, (adc_v % 10) + '0');
+                break;
+
+            case MODE_RES:
+                OLED_ShowString(0, 0, "MODE: RES   ");
+                Switch_Res_Range(resAutoStep); 
+                delay_ms(50); 
+                adc_r = Get_ADC(1);
+                
+                // 显示调试信息
+                OLED_ShowString(0, 2, "GEAR:");
+                if(resAutoStep == 0) OLED_ShowString(40, 2, "200K");
+                else if(resAutoStep == 1) OLED_ShowString(40, 2, "20K ");
+                else if(resAutoStep == 2) OLED_ShowString(40, 2, "2K  ");
+                else if(resAutoStep == 3) OLED_ShowString(40, 2, "200R");
+
+                // 计算电阻值
+                if (adc_r > 4050) {
+                    OLED_ShowString(0, 4, "VAL: OPEN    ");
+                } else {
+                    // 标准电阻数组
+                    float r_std_table[] = {200000.0f, 20000.0f, 2000.0f, 200.0f};
+                    // 计算公式：Rx = Rstd * ADC / (4095 - ADC)
+                    // 针对你的 510R 测量值 2479 做了微调补偿
+                    res_val = r_std_table[resAutoStep] * ((float)adc_r / (4095.0f - (float)adc_r)) * 1.02f; 
+                    
+                    OLED_ShowString(0, 4, "VAL:");
+                    if (res_val >= 1000.0f) {
+                        // K欧显示
+                        float k_res = res_val / 1000.0f;
+                        unsigned int k_int = (unsigned int)k_res;
+                        unsigned int k_dec = (unsigned int)(k_res * 100) % 100;
+                        OLED_ShowChar(40, 4, k_int / 10 + '0');
+                        OLED_ShowChar(48, 4, k_int % 10 + '0');
+                        OLED_ShowChar(56, 4, '.');
+                        OLED_ShowChar(64, 4, k_dec / 10 + '0');
+                        OLED_ShowChar(72, 4, k_dec % 10 + '0');
+                        OLED_ShowString(82, 4, "K");
+                    } else {
+                        // 欧姆显示
+                        unsigned int r_int = (unsigned int)res_val;
+                        OLED_ShowChar(40, 4, r_int / 100 + '0');
+                        OLED_ShowChar(48, 4, (r_int / 10) % 10 + '0');
+                        OLED_ShowChar(56, 4, r_int % 10 + '0');
+                        OLED_ShowString(68, 4, "Ohm");
+                    }
+                }
+
+                // 底部显示原始 ADC 值方便观察
+                OLED_ShowString(0, 6, "R_RAW:");
+                OLED_ShowChar(48, 6, (adc_r / 1000) + '0');
+                OLED_ShowChar(56, 6, (adc_r / 100 % 10) + '0');
+                OLED_ShowChar(64, 6, (adc_r / 10 % 10) + '0');
+                OLED_ShowChar(72, 6, (adc_r % 10) + '0');
+                break;
+
+            case MODE_CONT:
+                OLED_ShowString(0, 0, "MODE: CONT  ");
+                Switch_Res_Range(3); // 强制使用 200R 档位
+                delay_ms(10);
+                adc_r = Get_ADC(1);
+
+                if (adc_r < 100) { // 阈值设为约 10-20 欧姆
+                    OLED_ShowString(0, 4, "STATUS: SHORT ");
+                    BEEP = 1; // 鸣叫
+                } else {
+                    OLED_ShowString(0, 4, "STATUS: OPEN  ");
+                    BEEP = 0; // 静音
+                }
+                break;
+            /*case MODE_FREQ:
+                Measure_Freq_Duty(); // 使用带超时保护的版本，防止卡死
+                OLED_ShowString(0, 0, "MODE: FREQ/DUTY");
+                
+                OLED_ShowString(0, 2, "F:");
+                if (Actual_Freq < 1000) {
+                    OLED_ShowNumber(24, 2, Actual_Freq, 5, 16); 
+                    OLED_ShowString(64, 2, " Hz ");
+                } else {
+                    OLED_ShowNumber(24, 2, Actual_Freq / 1000, 3, 16); 
+                    OLED_ShowString(48, 2, ".");
+                    OLED_ShowNumber(56, 2, (Actual_Freq % 1000) / 100, 1, 16);
+                    OLED_ShowString(64, 2, " KHz");
+                }
+
+                OLED_ShowString(0, 4, "D:");
+                OLED_ShowNumber(24, 4, (unsigned long)Actual_Duty, 3, 16);
+                OLED_ShowString(56, 4, " %   ");
+                break;*/
+            case MODE_FREQ:
+                OLED_ShowString(0, 0, "MODE: MEASURE ");
+                
+                // --- 正确的保护：关闭中断允许，而不是操作标志位 ---
+                EX0 = 0; // 暂时禁止外部中断 0 中断
+                {
+                    unsigned long p_copy = T_Period;
+                    unsigned long h_copy = T_High;
+                    EX0 = 1; // 恢复中断允许
+
+                    // 50Hz 对应的脉冲数约为 480,000，判定范围要合理
+                    if (p_copy > 1000 && p_copy < 2400000L) { 
+                        Actual_Freq = MAIN_Fosc / p_copy;
+                        Actual_Duty = (h_copy * 100) / p_copy;
+                    } else {
+                        Actual_Freq = 0;
+                        Actual_Duty = 0;
+                    }
+                }
+
+                // --- 刷新显示 ---
+                OLED_ShowString(24, 2, "      "); // 清空旧数字位
+                OLED_ShowNumber(24, 2, Actual_Freq, 6, 16);
+                OLED_ShowString(80, 2, "Hz");
+                
+                OLED_ShowString(24, 4, "   ");
+                OLED_ShowNumber(24, 4, (unsigned long)Actual_Duty, 3, 16);
+                OLED_ShowString(56, 4, "%");
+                break;
+            case MODE_DIODE:
+                OLED_ShowString(0, 0, "MODE: DIODE ");
+                Switch_Res_Range(2); // 强制使用 2k 档位 (利用其恒流/分压特性)
+                delay_ms(20);
+                adc_r = Get_ADC(1);
+                
+                // 计算导通压降
+                voltage = 5.0f * (float)adc_r / 4095.0f; 
+                
+                OLED_ShowString(0, 2, "Vdrop:");
+                if (voltage > 3.5f) {
+                    OLED_ShowString(48, 2, "OPEN  "); // 增加空格清除上次显示的残留
+                } else {
+                    // 显示压降数值，例如 0.65V
+                    // 修正：增加第5个参数 size=16
+                    OLED_ShowNumber(48, 2, (unsigned long)voltage, 1, 16); 
+                    OLED_ShowChar(56, 2, '.'); 
+                    OLED_ShowNumber(64, 2, (unsigned long)(voltage * 100) % 100, 2, 16);
+                    OLED_ShowChar(80, 2, 'V');
+                    OLED_ShowString(88, 2, "  "); // 清理余量
+                }
+                break;
+        }
+        delay_ms(50); 
+    }
+}
