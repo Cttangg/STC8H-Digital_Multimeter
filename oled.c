@@ -148,3 +148,19 @@ void OLED_ShowNumber(unsigned char x, unsigned char y, unsigned long num, unsign
         OLED_ShowChar(x + (size / 2) * t, y, temp + '0'); 
     }
 }
+
+void OLED_ShowChinese(unsigned char x, unsigned char y, unsigned char index) {
+    unsigned char i;
+    
+    // 1. 写入汉字上半部分 (前 16 个字节)
+    OLED_SetPos(x, y); // 使用你 oled.c 中定义的函数名
+    for(i = 0; i < 16; i++) {
+        Write_Dat(Chinese_16x16[index][i]); // 使用已有的写数据函数
+    }
+    
+    // 2. 写入汉字下半部分 (后 16 个字节)
+    OLED_SetPos(x, y + 1); // 汉字高度占 2 页
+    for(i = 16; i < 32; i++) {
+        Write_Dat(Chinese_16x16[index][i]); 
+    }
+}

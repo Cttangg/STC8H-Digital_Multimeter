@@ -13,4 +13,5 @@ void OLED_Clear(void);
 void OLED_ShowChar(unsigned char x, unsigned char y, unsigned char chr);
 void OLED_ShowString(unsigned char x, unsigned char y, char *s);
 void OLED_ShowNumber(unsigned char x, unsigned char y, unsigned long num, unsigned char len, unsigned char size);
+void OLED_ShowChinese(unsigned char x, unsigned char y, unsigned char num);
 #endif

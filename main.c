@@ -22,13 +22,14 @@ sbit R_SW_200  = P3^7;
 #define MODE_CONT 2     // 连通性测试模式
 #define MODE_FREQ 3     // 频率占空比测量模式
 #define MODE_DIODE 4    // 二极管测试模式
+#define MODE_AC_VOLT 5    // 交流电压测量模式
 
 // 定义电压量程
 #define RANGE_20V     0   // 20V 档
 #define RANGE_2000MV  1   // 2000mV 档
 
 
-#define ADC_ZERO 2110   // ADC 零点偏移值，基于实测数据微调后得到的校准值
+#define ADC_ZERO 2125   // ADC 零点偏移值，基于实测数据微调后得到的校准值
 #define CAL_VOLT 0.01267f   // 20V 档位系数 (即 5V / 4095 * 1000，单位换算)，根据实测值微调后得到的校准系数
 #define CAL_2000MV 66.11f    // 2000mV档位的系数 (即 20V档系数 * 1000，单位换算)
 
@@ -46,7 +47,8 @@ volatile unsigned long xdata T_Start = 0;   // T_Start: 上升沿时间戳
 volatile unsigned long xdata Overflow_Cnt = 0; // 溢出累加器
 unsigned int High_Overflow = 0; // 高电平期间的溢出数
 unsigned char xdata auto_delay_cnt = 0; // 跳档消抖计数器
-
+char xdata buf[32];               // 将 buf 移出 main 成为全局变量
+static unsigned int xdata ac_samples[64]; // 将采样数组定义为静态或全局，不占用栈空间
 // 基于主频的粗略延时函数，适用于简单的消抖和等待
 void delay_ms(unsigned int ms) {
     unsigned int i;
@@ -54,6 +56,13 @@ void delay_ms(unsigned int ms) {
         i = MAIN_Fosc / 13000;
         while (--i);
     } while (--ms);
+}
+
+// 基于主频的微秒级延时函数，适用于更精细的消抖和短暂等待
+void delay_us(unsigned int us) {
+    while (us--) {
+        _nop_(); _nop_(); _nop_(); _nop_(); 
+    }
 }
 
 unsigned char ScanKey() {
@@ -145,7 +154,8 @@ void ADC_Init() {
 unsigned int Get_ADC(unsigned char ch) {
     ADC_CONTR = 0x80 | ch; 
     _nop_(); _nop_(); _nop_(); _nop_(); 
-    delay_ms(1);           
+    //delay_ms(1);           
+    delay_us(50); // 等待采样稳定，100us 的延时更合理
     ADC_CONTR |= 0x40;     
     while (!(ADC_CONTR & 0x20)); 
     ADC_CONTR &= ~0x20;    
@@ -205,6 +215,27 @@ void External_INT0_ISR(void) interrupt 0 {
     }
 }
 
+void Welcome(void) {
+    // 第一行显示“数字万用表” (居中建议从 x=24 开始，每个字宽 16)
+    OLED_ShowChinese(24, 0, 0); // 数
+    OLED_ShowChinese(40, 0, 1); // 字
+    OLED_ShowChinese(56, 0, 2); // 万
+    OLED_ShowChinese(72, 0, 3); // 用
+    OLED_ShowChinese(88, 0, 4); // 表
+    
+    // 第三行显示作者信息
+    // 注意：因为汉字占了两行（0和1），这里从第 4 页开始显示
+    OLED_ShowChinese(32, 4, 5); // 陈
+    OLED_ShowChinese(48, 4, 6); // 皓
+    OLED_ShowChinese(64, 4, 7); // 宇
+    
+    // 第四行显示学号 (使用你原有的 ShowString 函数)
+    OLED_ShowString(24, 6, "25521033"); 
+    
+    delay_ms(2500); // 维持 2.5 秒
+    OLED_Clear();
+}
+
 void main() {
 
     // --- 0. 变量定义  ---
@@ -215,10 +246,11 @@ void main() {
     unsigned char currentMode = 0;   // 当前大模式 (0-4)
     unsigned char currentRange = 0; // 电压模式下的量程
     unsigned char resAutoStep = 0;  // 电阻模式下的当前尝试档位
-    char xdata buf[20]; // 显示缓冲区
+    //char xdata buf[20]; // 显示缓冲区
     bit isAutoRes = 1;           // 1: 自动量程, 0: 手动量程
     unsigned char auto_cnt = 0;  // 跳档消抖计数器
-
+    unsigned long sum_raw = 0;
+    float v_avg, v_now, sum_sq = 0;
 
     // --- 1. 硬件初始化 ---
     P_SW2 |= 0x80; 
@@ -227,6 +259,9 @@ void main() {
     P1M1 = 0x3A; 
     P1M0 = 0x01; 
     BEEP = 0;
+    //p1.4设置为高阻输入
+    P1M1 |= 0x10;
+    P1M0 &= ~0x10;
 
     // P3 配置：
     // 1. 立即将 P3.4-P3.7 (量程开关) 设为高阻输入，防止干扰电压测量
@@ -240,18 +275,22 @@ void main() {
     P2M1 &= ~0x30; P2M0 &= ~0x30;
 
     OLED_Init(); // OLED 初始化
+    Welcome();    // 欢迎界面
     OLED_Clear();   // 清屏
     ADC_Init();  // ADC 初始化
     Hardware_Capture_Init();    // 包含频率占空比测量的初始化
 
+    //调试：直接跳到对应模式
+    //二极管正负测试
+    //currentMode = MODE_DIODE;
+
     // --- 2. 主循环 ---
     while(1) {
-
         // --- A. 按键扫描 ---
         keyAction = ScanKey(); 
         if (keyAction == 2) { // 长按：切换大模式
             currentMode++;
-            if (currentMode > 4) currentMode = 0;
+            if (currentMode > 5) currentMode = 0;
             
             // 模式切换后的彻底初始化
             BEEP = 0;           
@@ -318,15 +357,15 @@ void main() {
 
                 // --- 修正零点偏移 ---
                 // 使用实测值 2125 作为基准
-                if (adc_v > 2122 && adc_v < 2128) { 
+                if (adc_v > 1850 && adc_v < 1860) { 
                     voltage = 0.0f; // 强制归零，防止抖动
                 } else {
-                    if (adc_v >= 2125) {
+                    if (adc_v >= 1855) {
                         // 正电压计算
-                        voltage = (float)((long)adc_v - 2125) * 0.03848f;
+                        voltage = (float)((long)adc_v - 1855) * 0.01301f;
                     } else {
                         // 负电压计算
-                        voltage = (float)((long)adc_v - 2125) * 0.02619f;
+                        voltage = (float)((long)adc_v - 1855) * 0.00588f;
                     }
                 }
 
@@ -359,100 +398,122 @@ void main() {
                 break;
 
             case MODE_RES:
-                // 切换到当前档位并等待稳定
+                // --- 1. 硬件采样 ---
                 Switch_Res_Range(resAutoStep);
-                delay_ms(25); 
+                delay_ms(30); 
                 adc_r = Get_ADC(1);
 
-                // --- 1. 自动跳档逻辑 ---
+                // --- 2. 自动跳档逻辑 (修复 Bug 2: 计数器重置冲突) ---
                 if (isAutoRes) {
-                    if (resAutoStep < 3) {
-                        unsigned int down_limit;
-                        // 200K 档(0) 实测 OPEN 为 2769，建议跌破 2500 就跳 20K 档
-                        if (resAutoStep == 0) down_limit = 2500; 
-                        else if (resAutoStep == 1) down_limit = 1500; 
-                        else down_limit = 500; 
+                    unsigned int down_limit = 0, up_limit = 5000; // 初始化边界
 
-                        if (adc_r < down_limit) {
-                            if (++auto_cnt > 3) { 
-                                resAutoStep++; 
-                                auto_cnt = 0; OLED_Clear(); break; 
-                            }
-                        } else auto_cnt = 0;
+                    // 设置当前档位的判定边界
+                    if (resAutoStep == 0) { down_limit = 2580; up_limit = 4095; }
+                    else if (resAutoStep == 1) { down_limit = 2200; up_limit = 2800; }
+                    else if (resAutoStep == 2) { down_limit = 1000; up_limit = 3000; }
+                    else if (resAutoStep == 3) { down_limit = 0;    up_limit = 2500; }
+
+                    // 核心跳档判定：不在区间内才计数
+                    if (resAutoStep < 3 && adc_r < down_limit) {
+                        if (++auto_cnt > 3) { 
+                            resAutoStep++; auto_cnt = 0; OLED_Clear(); break; 
+                        }
+                    } 
+                    else if (resAutoStep > 0 && adc_r > up_limit) {
+                        if (++auto_cnt > 3) { 
+                            resAutoStep--; auto_cnt = 0; OLED_Clear(); break; 
+                        }
                     }
-
-                    if (resAutoStep > 0) {
-                        unsigned int up_limit;
-                        // 20K 档(1) 实测 OPEN 为 3754，建议 3600 升档
-                        if (resAutoStep == 1) up_limit = 3600;
-                        else up_limit = 4000; 
-
-                        if (adc_r > up_limit) {
-                            if (++auto_cnt > 3) {
-                                resAutoStep--; 
-                                auto_cnt = 0; OLED_Clear(); break;
-                            }
-                        } else auto_cnt = 0;
+                    else {
+                        auto_cnt = 0; // 只有在合适的范围内，才清零计数器
                     }
                 }
 
-                // --- 2. 界面显示 (自动模式屏蔽 GEAR) ---
+                // --- 3. 界面显示 (修复 Bug 1: 手动模式不显示档位) ---
                 if (isAutoRes) {
                     OLED_ShowString(0, 0, "MODE: RES [AUTO]");
-                    OLED_ShowString(0, 2, "                "); 
+                    OLED_ShowString(0, 2, "                "); // 自动模式隐藏档位行
                 } else {
                     OLED_ShowString(0, 0, "MODE: RES [MANU]");
-                    if(resAutoStep == 0)      sprintf(buf, "GEAR: 200K    ");
-                    else if(resAutoStep == 1) sprintf(buf, "GEAR: 20K     ");
-                    else if(resAutoStep == 2) sprintf(buf, "GEAR: 2K      ");
-                    else                      sprintf(buf, "GEAR: 200R    ");
+                    // 确保手动模式下每一帧都更新档位显示
+                    if(resAutoStep == 0)      sprintf(buf, "GEAR: 200K     ");
+                    else if(resAutoStep == 1) sprintf(buf, "GEAR: 20K      ");
+                    else if(resAutoStep == 2) sprintf(buf, "GEAR: 2K       ");
+                    else                      sprintf(buf, "GEAR: 200R     ");
                     OLED_ShowString(0, 2, buf);
                 }
 
-                // --- 3. 数值计算 (使用实测阻值校准) ---
-                if (resAutoStep == 0) { // 200K 档位计算 
-                    if (adc_r > 2750) sprintf(buf, "VAL: OPEN      ");
-                    else {
-                        // 使用 197K 作为基准，并根据 OPEN 值修正非线性
-                        res_val = 197000.0f * ((float)adc_r / 2700.0f) * (69.0f / (2769.0f - (float)adc_r));
-                        sprintf(buf, "VAL: %7.2f K ", res_val / 1000.0f);
+                // --- 4. 核心数值计算 ---
+                {
+                    float adcf = (float)adc_r;
+                    if (resAutoStep == 0) { // 200K
+                        if (adc_r >= 2830) sprintf(buf, "VAL:  OPEN      ");
+                        else {
+                            res_val = (121.0f * (adcf - 2522.0f)) / (2840.0f - adcf);
+                            sprintf(buf, "VAL: %7.2f K ", (res_val < 0) ? 0 : res_val);
+                        }
+                    } 
+                    else if (resAutoStep == 1) { // 20K
+                        if (adc_r >= 3740) sprintf(buf, "VAL:  OPEN      ");
+                        else {
+                            res_val = (45.0f * (adcf - 2020.0f)) / (3755.0f - adcf);
+                            sprintf(buf, "VAL: %7.2f K ", (res_val < 0) ? 0 : res_val);
+                        }
                     }
-                } 
-                else { 
-                    float r_std;
-                    float a_max;
-                    if(resAutoStep == 1)      { r_std = 16900.0f; a_max = 3754.0f; } // 20K 档
-                    else if(resAutoStep == 2) { r_std = 1900.0f;  a_max = 4053.0f; } // 2K 档
-                    else                      { r_std = 190.0f;   a_max = 4090.0f; } // 200R 档
-
-                    if (adc_r >= (unsigned int)a_max - 20) {
-                        sprintf(buf, "VAL: OPEN      ");
-                    } else {
-                        // 标准分压公式：Rx = Rstd * (ADC / (ADC_max - ADC))
-                        res_val = r_std * ((float)adc_r / (a_max - (float)adc_r));
-                        
-                        if (res_val >= 1000.0f) sprintf(buf, "VAL: %7.2f K ", res_val / 1000.0f);
-                        else sprintf(buf, "VAL: %7.1f R ", res_val);
+                    else if (resAutoStep == 2) { // 2K
+                        if (adc_r >= 4040) sprintf(buf, "VAL:  OPEN      ");
+                        else {
+                            res_val = (2800.0f * (adcf - 720.0f)) / (4055.0f - adcf);
+                            if (res_val < 0) res_val = 0;
+                            if (res_val >= 1000.0f) sprintf(buf, "VAL: %7.2f K ", res_val / 1000.0f);
+                            else sprintf(buf, "VAL: %7.1f R ", res_val);
+                        }
+                    }
+                    else { // 200R
+                        if (adc_r >= 4075) sprintf(buf, "VAL:  OPEN      ");
+                        else {
+                            res_val = (329.0f * (adcf - 65.0f)) / (4090.0f - adcf);
+                            sprintf(buf, "VAL: %7.1f R ", (res_val < 0) ? 0 : res_val);
+                        }
                     }
                 }
+
+                // --- 5. 刷新显示 ---
                 OLED_ShowString(0, 4, buf);
-                sprintf(buf, "R_RAW: %4u     ", adc_r);
+                sprintf(buf, "R_RAW: %4u     ", adc_r); 
                 OLED_ShowString(0, 6, buf);
                 break;
 
             case MODE_CONT:
-                OLED_ShowString(0, 0, "MODE: CONT  ");
-                Switch_Res_Range(3); // 强制使用 200R 档位
-                delay_ms(10);
+                OLED_ShowString(0, 0, "MODE: CONT     ");
+                Switch_Res_Range(3); // 强制使用 200R 档位以获得 10Ω 附近最高精度
+                delay_ms(20);        // 给电容充电/切换留足时间
                 adc_r = Get_ADC(1);
 
-                if (adc_r < 100) { // 阈值设为约 10-20 欧姆
+                // --- 核心判定逻辑 ---
+                // 根据实测参数：10欧姆对应 ADC 约为 184
+                if (adc_r < 184) { 
                     OLED_ShowString(0, 4, "STATUS: SHORT ");
-                    BEEP = 1; // 鸣叫
+                    BEEP = 1; 
                 } else {
                     OLED_ShowString(0, 4, "STATUS: OPEN  ");
-                    BEEP = 0; // 静音
+                    BEEP = 0; 
                 }
+
+                // --- 可选：实时显示阻值，方便确认 ---
+                /*
+                {
+                    float adcf = (float)adc_r;
+                    if (adc_r >= 4075) {
+                        sprintf(buf, "RES:  O.L      ");
+                    } else {
+                        // 使用你实测的 200R 拟合公式计算实时电阻
+                        res_val = (329.0f * (adcf - 65.0f)) / (4090.0f - adcf);
+                        if (res_val < 0) res_val = 0;
+                        sprintf(buf, "RES: %5.1f R    ", res_val);
+                    }
+                    OLED_ShowString(0, 6, buf);
+                }*/
                 break;
 
             case MODE_FREQ:
@@ -480,27 +541,104 @@ void main() {
                 break;
             
             case MODE_DIODE:
-                OLED_ShowString(0, 0, "MODE: DIODE   ");
-                Switch_Res_Range(2); // 使用 2k 档（约 1.9k）作为恒流源
-                delay_ms(25);
-                adc_r = Get_ADC(1);
+                OLED_ShowString(0, 0, "MODE: DIODE    ");
                 
-                // 计算压降：根据短接为0的逻辑，直接比例换算
-                // 如果你的系统参考电压是 5V，则使用 5.0f
-                voltage = 5.0f * (float)adc_r / 4095.0f;
+                // --- 1. 均值采样 (减少数据跳变) ---
+                Switch_Res_Range(2); 
+                delay_ms(30);
+                {
+                    unsigned long sum = 0;
+                    unsigned char i;
+                    for(i=0; i<8; i++) sum += Get_ADC(1); // 累加8次
+                    adc_r = (unsigned int)(sum >> 3);    // 求平均值
+                }
+                voltage = 5.0f * (float)adc_r / 4055.0f;
+
+                // --- 2. 后台特征探测 ---
+                Switch_Res_Range(1); 
+                delay_ms(10);
+                {
+                    unsigned int adc_check = Get_ADC(1);
+                    
+                    // --- 3. 逻辑判定 (加入噪声余量) ---
+                    
+                    // 空载判定：给天花板留出 10 个单位的噪声余量
+                    // 2K档空载 4055 -> 阈值设为 4045
+                    // 20K档空载 3755 -> 阈值设为 3745
+                    if (adc_r >= 4045 && adc_check >= 3745) {
+                        sprintf(buf, "Vf:            "); 
+                    }
+                    // 反接判定：只要不是绝对空载，且电压依然很高
+                    else if (adc_r >= 3850) {
+                        sprintf(buf, "Vf:     -      "); 
+                    }
+                    // 短路判定
+                    else if (adc_r < 60) {
+                        sprintf(buf, "Vf:  0.000 V   ");
+                    }
+                    // 正接导通
+                    else {
+                        sprintf(buf, "Vf:  %.3f V   ", voltage);
+                    }
+                }
+
+                Switch_Res_Range(2); 
+                OLED_ShowString(0, 2, buf);
+                OLED_ShowString(0, 4, "RED:[+]  BLK:[-] "); 
                 
-                // 判断逻辑：
-                // 1. 如果 ADC 接近最大值（如 > 4000），说明是反接或开路
-                if (adc_r > 4000) { 
-                    sprintf(buf, "Vdrop:  -      "); // 反接显示 -
+                // 辅助调试：观察噪声水平
+                // sprintf(buf, "RAW:%4u CHK:%4u", adc_r, adc_check);
+                // OLED_ShowString(0, 6, buf);
+                break;
+
+            case MODE_AC_VOLT: // 交流 2000mV 测量 (使用 P3.2)
+                // 强制 P3.4-P3.7 恢复高阻，确保 P3.2 不受电阻档供电干扰
+                P3M1 |= 0xF0; P3M0 &= ~0xF0; 
+                R_SW_200K = 0; R_SW_20K = 0; R_SW_2K = 0; R_SW_200 = 0;
+                OLED_ShowString(0, 0, "MODE: AC 2000mV");
+                {
+                    sum_raw = 0;
+                    sum_sq = 0;
+
+                    // 1. 高速采样
+                    // 注意：因为你的 Get_ADC 里有 delay_ms(1)，
+                    // 64次采样会耗时 64ms 以上，这刚好能覆盖约 3 个交流周期(50Hz)
+                    for(i = 0; i < 64; i++) {
+                        ac_samples[i] = Get_ADC(1); // 改为 P3.2 所在的通道 1
+                        sum_raw += ac_samples[i];
+                    }
+
+                    // 计算直流偏置 (DC Offset)
+                    v_avg = (float)sum_raw / 64.0f;
+
+                    // 2. 计算真有效值 (RMS)
+                    for(i = 0; i < 64; i++) {
+                        // 将原始 ADC 值减去偏移，并换算为电压 (mV)
+                        v_now = ((float)ac_samples[i] - v_avg) * (5000.0f / 4095.0f);
+                        sum_sq += v_now * v_now;
+                    }
+                    
+                    // 公式：$V_{rms} = \sqrt{\frac{\sum V_n^2}{N}}$
+                    voltage = (float)sqrt(sum_sq / 64.0f);
+                }
+
+                // 3. 结果显示
+                if (voltage > 2200.0f) {
+                    sprintf(buf, "VAL:  O.L      ");
                 } else {
-                    sprintf(buf, "Vdrop: %.3f V ", voltage);
+                    // 滤除极小的感应噪声
+                    if (voltage < 5.0f) voltage = 0.0f; 
+                    sprintf(buf, "VAL:%6.1f mV ", voltage); 
                 }
                 OLED_ShowString(0, 2, buf);
+
+                // 4. 同时监测频率 (P3.2 复用)
+                sprintf(buf, "FRQ:%7lu Hz ", Actual_Freq);
+                OLED_ShowString(0, 4, buf);
                 
-                // 第三行：固定显示极性参考，方便用户对准表笔
-                // 假设 P3.2 是红表笔（正），GND 是黑表笔（负）
-                OLED_ShowString(0, 4, "RED:A   BLK:K "); 
+                // 辅助观察：显示当前的直流偏置中点
+                sprintf(buf, "DC_OFF: %4.0f  ", v_avg);
+                OLED_ShowString(0, 6, buf);
                 break;
         }
     }
